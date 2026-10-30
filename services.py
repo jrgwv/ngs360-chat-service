@@ -1,8 +1,8 @@
 """
 Chat streaming service.
 
-Runs a LangChain agent (``create_agent``) backed by Claude on the AI Hub
-gateway and translates its event stream into the Vercel AI SDK UI Message
+Runs a LangChain agent (``create_agent``) backed by Claude on Amazon Bedrock
+(Converse API via ``langchain-aws``) and translates its event stream into the Vercel AI SDK UI Message
 Stream Protocol (SSE) the frontend's useChat consumes:
 https://ai-sdk.dev/docs/ai-sdk-ui/stream-protocol
 """
@@ -11,8 +11,9 @@ import json
 import uuid
 from typing import Any, AsyncGenerator
 
+from botocore.config import Config
 from langchain.agents import create_agent
-from langchain_anthropic import ChatAnthropic
+from langchain_aws import ChatBedrockConverse
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from config import get_settings
@@ -77,31 +78,54 @@ def to_lc_messages(
     return lc_messages
 
 
+def build_llm() -> ChatBedrockConverse:
+    """Bedrock Converse chat model.
+
+    AWS access resolves through the default boto3 chain (ECS task role in
+    deployed environments); no API key is configured. Construction makes no
+    AWS call; the first request does.
+    """
+    settings = get_settings()
+    return ChatBedrockConverse(
+        model=settings.LLM_MODEL,
+        region_name=settings.AWS_REGION,
+        max_tokens=8000,
+        config=Config(
+            read_timeout=300,
+            connect_timeout=10,
+            retries={"max_attempts": 3, "mode": "adaptive"},
+        ),
+    )
+
+
 def build_agent(token: str):
     """Construct a ReAct agent whose tools call the REST API with ``token``."""
-    settings = get_settings()
-    llm = ChatAnthropic(
-        model=settings.LLM_MODEL,
-        base_url=f"{settings.LLM_BASE_URL}/anthropic",
-        api_key=settings.LLM_API_KEY,
-        timeout=300,
-        max_tokens=8000,
-        streaming=True,
-    )
-    return create_agent(llm, build_tools(NGS360Client(token)))
+    return create_agent(build_llm(), build_tools(NGS360Client(token)))
 
 
 def _delta_text(chunk: Any) -> str:
-    """Extract streamable text from an AIMessageChunk (str or content-block list)."""
+    """Extract streamable answer text from an AIMessageChunk.
+
+    Bedrock Converse streams ``content`` as a list of blocks, e.g.
+    ``[{"type": "text", "text": "Hi", "index": 0}]``; some versions omit
+    ``type`` on text deltas. Tool-use and reasoning blocks are skipped so only
+    user-facing text reaches the SSE stream.
+    """
     content = getattr(chunk, "content", "")
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        return "".join(
-            block.get("text", "")
-            for block in content
-            if isinstance(block, dict) and block.get("type") == "text"
-        )
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif (
+                isinstance(block, dict)
+                and block.get("type", "text") == "text"
+                and isinstance(block.get("text"), str)
+            ):
+                parts.append(block["text"])
+        return "".join(parts)
     return ""
 
 
