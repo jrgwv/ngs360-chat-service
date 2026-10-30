@@ -21,6 +21,15 @@ _env_path = Path(__file__).parent / ".env"
 if _env_path.exists():
     load_dotenv(_env_path)
 
+# Placeholder shipped as the JWT secret default. The service refuses to start
+# with it (see ``validate_security_settings``).
+INSECURE_DEFAULT_JWT_SECRET = "change-this-secret-key-in-production"
+MIN_JWT_SECRET_LENGTH = 32
+
+
+class InsecureConfigurationError(RuntimeError):
+    """Raised at startup when security-critical settings are unsafe."""
+
 
 def get_secret(secret_name: str, region_name: str) -> dict | None:
     """Fetch and parse a JSON secret from AWS Secrets Manager."""
@@ -72,7 +81,7 @@ class Settings:
     # Shared with the REST API so its JWTs verify here.
     @property
     def JWT_SECRET_KEY(self) -> str:
-        return self._get("JWT_SECRET_KEY", default="change-this-secret-key-in-production")
+        return self._get("JWT_SECRET_KEY", default=INSECURE_DEFAULT_JWT_SECRET)
 
     @property
     def JWT_ALGORITHM(self) -> str:
@@ -92,3 +101,26 @@ class Settings:
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+def validate_security_settings(settings: Settings) -> None:
+    """Refuse to run with a placeholder or weak JWT secret.
+
+    Set ALLOW_INSECURE_DEV_SECRET=1 to bypass (local dev/test only). The secret
+    value itself is never included in the error or logged.
+    """
+    if os.getenv("ALLOW_INSECURE_DEV_SECRET") == "1":
+        return
+    secret = settings.JWT_SECRET_KEY or ""
+    if secret == INSECURE_DEFAULT_JWT_SECRET:
+        raise InsecureConfigurationError(
+            "JWT_SECRET_KEY is unset or still the placeholder default; set it "
+            "(env or ENV_SECRETS) to the REST API's signing secret. For local "
+            "dev only, ALLOW_INSECURE_DEV_SECRET=1 bypasses this check."
+        )
+    if len(secret) < MIN_JWT_SECRET_LENGTH:
+        raise InsecureConfigurationError(
+            f"JWT_SECRET_KEY is shorter than {MIN_JWT_SECRET_LENGTH} characters; "
+            "use a high-entropy secret. For local dev only, "
+            "ALLOW_INSECURE_DEV_SECRET=1 bypasses this check."
+        )

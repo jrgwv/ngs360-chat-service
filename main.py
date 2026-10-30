@@ -12,12 +12,14 @@ from fastapi.responses import StreamingResponse
 
 import services
 from auth import AuthDep
-from config import get_settings
+from config import get_settings, validate_security_settings
 from models import ChatRequest
 
 app = FastAPI(title="NGS360 Chat Service")
 
 settings = get_settings()
+# Fail fast at import (gunicorn worker boot) on a placeholder/weak JWT secret.
+validate_security_settings(settings)
 if settings.CLIENT_ORIGIN:
     app.add_middleware(
         CORSMiddleware,
