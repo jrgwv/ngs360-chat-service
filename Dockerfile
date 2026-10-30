@@ -4,11 +4,17 @@ FROM public.ecr.aws/docker/library/python:3.13-slim
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends curl \
+# Apply Debian security fixes published after the base image was built. pip and
+# setuptools are removed after the dependency install below (their vendored msgpack
+# and urllib3 carry CVEs and the runtime needs neither).
+RUN apt-get update \
+    && apt-get upgrade -y --no-install-recommends \
+    && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+    && pip uninstall -y pip setuptools wheel
 
 COPY . .
 
