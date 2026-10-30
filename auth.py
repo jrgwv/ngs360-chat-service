@@ -12,7 +12,7 @@ from typing import Annotated
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
-from jose import JWTError, jwt
+import jwt
 
 from config import get_settings
 
@@ -35,11 +35,13 @@ def get_auth(token: Annotated[str, Depends(oauth2_scheme)]) -> AuthContext:
         headers={"WWW-Authenticate": "Bearer"},
     )
     try:
+        # PyJWT verifies signature and exp by default; pinning ``algorithms``
+        # prevents algorithm-confusion (e.g. "none" or RS/HS swaps).
         payload = jwt.decode(
             token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM]
         )
-    except JWTError:
-        raise credentials_exception
+    except jwt.PyJWTError:
+        raise credentials_exception from None
 
     username = payload.get("sub")
     if not username:
