@@ -26,7 +26,7 @@ if _env_path.exists():
 
 # Placeholder shipped as the JWT secret default. The service refuses to start
 # with it (see ``validate_security_settings``).
-INSECURE_DEFAULT_JWT_SECRET = "change-this-secret-key-in-production"
+INSECURE_DEFAULT_JWT_SECRET = "change-this-secret-key-in-production"  # nosec B105 - denied sentinel, not a credential
 MIN_JWT_SECRET_LENGTH = 32
 
 
