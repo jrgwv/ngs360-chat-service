@@ -17,13 +17,30 @@ from models import ChatRequest
 
 app = FastAPI(title="NGS360 Chat Service")
 
+
+def cors_origins(client_origin: str | None) -> list[str]:
+    """Explicit CORS allowlist from CLIENT_ORIGIN.
+
+    Unset/blank -> [] (no CORS middleware, so no cross-origin access). A
+    wildcard is refused: combined with allow_credentials it would let any site
+    make credentialed requests.
+    """
+    origin = (client_origin or "").strip()
+    if not origin:
+        return []
+    if origin == "*":
+        raise ValueError("CLIENT_ORIGIN must be an explicit origin, not '*'")
+    return [origin]
+
+
 settings = get_settings()
 # Fail fast at import (gunicorn worker boot) on a placeholder/weak JWT secret.
 validate_security_settings(settings)
-if settings.CLIENT_ORIGIN:
+_origins = cors_origins(settings.CLIENT_ORIGIN)
+if _origins:
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=[settings.CLIENT_ORIGIN],
+        allow_origins=_origins,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
