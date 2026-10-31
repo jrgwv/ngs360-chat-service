@@ -8,6 +8,7 @@ https://ai-sdk.dev/docs/ai-sdk-ui/stream-protocol
 """
 
 import json
+import logging
 import uuid
 from typing import Any, AsyncGenerator
 
@@ -20,6 +21,8 @@ from config import get_settings
 from models import ChatContext
 from ngs360_client import NGS360Client
 from tools import build_tools
+
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = (
     "You are the NGS360 assistant. You help users work with their genomics "
@@ -164,3 +167,41 @@ async def stream_reply(
     yield sse_chunk({"type": "text-end", "id": text_id})
     yield sse_chunk({"type": "finish"})
     yield "data: [DONE]\n\n"
+
+
+def frame(payload: dict[str, Any]) -> str:
+    """One frame of the chat UI's stream (thread / status / text / done / error)."""
+    return sse_chunk(payload)
+
+
+async def stream_frames(
+    messages: list[dict[str, Any]],
+    token: str,
+    context: ChatContext | None,
+    thread_id: str | None,
+) -> AsyncGenerator[str, None]:
+    """Run the agent and stream its reply as the chat UI's own frames.
+
+    This is the protocol of the REST API's ``POST /api/v1/chat/stream``, which the
+    frontend's chat transport maps onto the AI SDK: a ``thread`` frame first, a
+    ``status`` frame when a tool is called, ``text`` frames for the answer, then
+    ``done`` (or ``error``). The service is stateless, so the thread id is only
+    echoed (or minted) for the client's bookkeeping.
+    """
+    yield frame({"type": "thread", "thread_id": thread_id or str(uuid.uuid4())})
+    try:
+        agent = build_agent(token)
+        lc_messages = to_lc_messages(messages, context)
+        async for event in agent.astream_events({"messages": lc_messages}, version="v2"):
+            kind = event["event"]
+            if kind == "on_tool_start" and event.get("name"):
+                yield frame({"type": "status", "tool": event["name"]})
+            elif kind == "on_chat_model_stream":
+                delta = _delta_text(event["data"]["chunk"])
+                if delta:
+                    yield frame({"type": "text", "delta": delta})
+    except Exception:  # noqa: BLE001 - reported in-band; never leak internals to the client
+        logger.exception("chat stream failed")
+        yield frame({"type": "error", "message": "The assistant ran into a problem. Please try again."})
+        return
+    yield frame({"type": "done"})
