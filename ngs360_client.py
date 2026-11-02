@@ -19,9 +19,10 @@ class NGS360Client:
     def __init__(self, token: str) -> None:
         settings = get_settings()
         self._base = settings.NGS360_API_URL.rstrip("/")
+        self._wes_base = settings.NGS360_WES_URL.rstrip("/")
         self._headers = {"Authorization": f"Bearer {token}"}
 
-    async def _get(self, path: str, params: dict | None = None) -> dict:
+    async def _get(self, path: str, params: dict | None = None, base: str | None = None) -> dict:
         """GET with one retry on a timeout, connection error or 5xx.
 
         These are idempotent reads, and the API's search can stall for several seconds when its
@@ -30,7 +31,7 @@ class NGS360Client:
         for attempt in (1, 2):
             try:
                 async with httpx.AsyncClient(timeout=30) as client:
-                    resp = await client.get(f"{self._base}{path}", headers=self._headers, params=params)
+                    resp = await client.get(f"{base or self._base}{path}", headers=self._headers, params=params)
                 if resp.status_code >= 500 and attempt == 1:
                     await asyncio.sleep(RETRY_DELAY_S)
                     continue
@@ -83,3 +84,22 @@ class NGS360Client:
         """Newest QC record for a project or a sequencing run (``latest`` is the API default)."""
         params = {"project_id": project_id} if project_id else {"sequencing_run_id": run_id}
         return await self._get("/qcmetrics/search", {**params, "latest": "true", "per_page": 20})
+
+    # ---- analysis (workflow) runs, served by the WES service with the same user token --------------
+
+    async def list_wes_runs(self, max_rows: int = 200) -> list[dict]:
+        runs: list[dict] = []
+        token = ""
+        while len(runs) < max_rows:
+            params = {"page_size": 100}
+            if token:
+                params["page_token"] = token
+            data = await self._get("/runs", params, base=self._wes_base)
+            runs.extend(data.get("runs", []))
+            token = data.get("next_page_token") or ""
+            if not token:
+                break
+        return runs[:max_rows]
+
+    async def get_wes_run(self, run_id: str) -> dict:
+        return await self._get(f"/runs/{run_id}", base=self._wes_base)

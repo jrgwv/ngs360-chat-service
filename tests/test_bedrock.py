@@ -165,5 +165,5 @@ def test_stream_tool_call_emits_navigate(monkeypatch):
     names = {t["toolSpec"]["name"] for t in fake.calls[0]["toolConfig"]["tools"]}
     assert names == {
         "navigate", "lookup_project", "search_projects", "search_runs", "get_run",
-        "list_project_samples", "get_qc",
+        "list_project_samples", "get_qc", "list_workflow_runs", "get_workflow_run", "explain_workflow_failure",
     }

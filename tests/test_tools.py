@@ -26,6 +26,30 @@ RUNS = [
 ]
 
 
+WES_RUNS = [
+    {"run_id": "w-ok", "state": "COMPLETE", "name": "demo-hello", "start_time": "2026-11-02T14:51:58Z",
+     "end_time": "2026-11-02T14:58:31Z", "tags": {"ProjectId": "P-4"}},
+    {"run_id": "w-bad", "state": "EXECUTOR_ERROR", "name": "sandbox-hello", "start_time": "2026-10-31T01:05:05Z",
+     "end_time": "2026-10-31T01:10:29Z", "tags": {"ProjectId": "P-2"}},
+    {"run_id": "w-old", "state": "SYSTEM_ERROR", "name": "sandbox-hello", "start_time": "2026-10-30T10:00:00Z",
+     "end_time": "2026-10-30T10:03:00Z", "tags": {"ProjectId": "P-1"}},
+]
+LOG_URL = "https://console.example/cloudwatch#logs/log-events/run%2F2933968"
+WES_FULL = {
+    "w-ok": {"run_id": "w-ok", "state": "COMPLETE", "name": "demo-hello",
+             "request": {"tags": {"ProjectId": "P-4"}, "workflow_url": "wf:1",
+                         "workflow_engine_parameters": {"outputUri": "s3://out/P-4/"}},
+             "run_log": {"start_time": "t0", "end_time": "t1", "exit_code": 0},
+             "outputs": {"log_urls": {"run_log": "https://console.example/cloudwatch#logs/log-events/run%2F7408798"}}},
+    "w-bad": {"run_id": "w-bad", "state": "EXECUTOR_ERROR", "name": "sandbox-hello",
+              "request": {"tags": {"ProjectId": "P-2"}, "workflow_url": "wf:2", "workflow_engine_parameters": {}},
+              "run_log": {"start_time": "t0", "end_time": "t1", "exit_code": 1},
+              "outputs": {"log_urls": {"run_log": LOG_URL}}},
+    "w-nolink": {"run_id": "w-nolink", "state": "EXECUTOR_ERROR", "name": "x", "request": {"tags": {}},
+                 "run_log": {}, "outputs": {}},
+}
+
+
 class FakeClient:
     def __init__(self, total_projects=None):
         self.total_projects = total_projects
@@ -52,6 +76,14 @@ class FakeClient:
 
     async def get_project(self, project_id):
         return {}
+
+    async def list_wes_runs(self):
+        return WES_RUNS
+
+    async def get_wes_run(self, run_id):
+        if run_id not in WES_FULL:
+            raise httpx.HTTPStatusError("404", request=None, response=None)
+        return WES_FULL[run_id]
 
     async def search_qc(self, project_id="", run_id=""):
         def m(name, status, cov):
@@ -190,3 +222,63 @@ def test_get_qc_failing_only_and_empty_and_args():
     assert "No QC records" in asyncio.run(tool("get_qc").ainvoke({"project_id": "EMPTY"}))
     assert "exactly one" in asyncio.run(tool("get_qc").ainvoke({}))
     assert "exactly one" in asyncio.run(tool("get_qc").ainvoke({"project_id": "a", "run_id": "b"}))
+
+
+# ---- analysis (workflow) runs and failure explanation --------------------------------------------
+
+def test_list_workflow_runs_failed_means_executor_and_system_errors_newest_first():
+    out = asyncio.run(tool("list_workflow_runs").ainvoke({"state": "failed"}))
+    assert "2 analysis run(s)" in out and "w-ok" not in out
+    assert out.index("w-bad") < out.index("w-old")  # newest first
+
+
+def test_list_workflow_runs_state_words_project_filter_and_empty():
+    assert "w-ok" in asyncio.run(tool("list_workflow_runs").ainvoke({"state": "completed"}))
+    assert "w-ok" in asyncio.run(tool("list_workflow_runs").ainvoke({"state": "complete"}))
+    out = asyncio.run(tool("list_workflow_runs").ainvoke({"project_id": "p-2"}))
+    assert "w-bad" in out and "w-ok" not in out  # case-insensitive project match
+    assert "w-ok" in asyncio.run(tool("list_workflow_runs").ainvoke({"state": "COMPLETE", "project_id": "P-4"}))
+    assert "No analysis runs match" in asyncio.run(tool("list_workflow_runs").ainvoke({"state": "running"}))
+    assert len(asyncio.run(tool("list_workflow_runs").ainvoke({})).splitlines()) == 4  # header + 3 runs
+
+
+def test_get_workflow_run_summarises_and_maps_to_the_healthomics_run():
+    out = asyncio.run(tool("get_workflow_run").ainvoke({"run_id": "w-ok"}))
+    assert "state COMPLETE" in out and "project P-4" in out and "exit code 0" in out
+    assert "HealthOmics run 7408798" in out and "s3://out/P-4/" in out
+    assert "Could not fetch" in asyncio.run(tool("get_workflow_run").ainvoke({"run_id": "missing"}))
+
+
+def test_explain_failure_uses_the_healthomics_reason(monkeypatch):
+    seen = []
+
+    async def fake_describe(omics_run_id):
+        seen.append(omics_run_id)
+        return {"status": "FAILED", "failure_reason": "CANNOT_START_CONTAINER_ERROR",
+                "message": "Unable to start workflow task: main.cwl", "failed_tasks": [
+                    {"name": "main.cwl", "status": "FAILED", "message": ""}],
+                "log_tail": ["engine: container exited"]}
+
+    monkeypatch.setattr(tools.omics_client, "describe_failure", fake_describe)
+    out = asyncio.run(tool("explain_workflow_failure").ainvoke({"run_id": "w-bad"}))
+    assert seen == ["2933968"]  # taken from the WES record's log link, not from anything the user typed
+    assert "CANNOT_START_CONTAINER_ERROR" in out and "Unable to start workflow task" in out
+    assert "Failed task main.cwl" in out and "engine: container exited" in out
+
+
+def test_explain_failure_refuses_runs_that_did_not_fail_or_have_no_link_or_cannot_be_read(monkeypatch):
+    called = []
+
+    async def boom(omics_run_id):
+        called.append(omics_run_id)
+        raise RuntimeError("AccessDenied")
+
+    monkeypatch.setattr(tools.omics_client, "describe_failure", boom)
+    ok = asyncio.run(tool("explain_workflow_failure").ainvoke({"run_id": "w-ok"}))
+    assert "not failed" in ok and not called  # a healthy run triggers no HealthOmics call
+    nolink = asyncio.run(tool("explain_workflow_failure").ainvoke({"run_id": "w-nolink"}))
+    assert "did not record a HealthOmics run" in nolink and not called
+    denied = asyncio.run(tool("explain_workflow_failure").ainvoke({"run_id": "w-bad"}))
+    assert "could not be read (RuntimeError)" in denied and "AccessDenied" not in denied  # no raw error text
+    unknown = asyncio.run(tool("explain_workflow_failure").ainvoke({"run_id": "nope"}))
+    assert "Could not fetch" in unknown and len(called) == 1  # an unknown run id never reaches HealthOmics

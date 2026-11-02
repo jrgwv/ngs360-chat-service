@@ -14,6 +14,7 @@ from typing import Any
 
 from langchain_core.tools import tool
 
+import omics_client
 from ngs360_client import NGS360Client
 
 NAVIGABLE_TYPES = ("project", "run", "job")
@@ -40,6 +41,45 @@ def _more(shown: int, matched: int, fetched: int, total: int) -> str:
     if fetched < total:
         note += f"\nOnly the {fetched} most recent of {total} records were searched."
     return note
+
+
+# Analysis (workflow) run states reported by WES, and the plain words people use for them.
+FAILED_STATES = ("EXECUTOR_ERROR", "SYSTEM_ERROR")
+STATE_ALIASES = {
+    "failed": FAILED_STATES,
+    "failure": FAILED_STATES,
+    "failures": FAILED_STATES,
+    "error": FAILED_STATES,
+    "running": ("RUNNING", "INITIALIZING", "QUEUED"),
+    "in progress": ("RUNNING", "INITIALIZING", "QUEUED"),
+    "queued": ("QUEUED",),
+    "completed": ("COMPLETE",),
+    "complete": ("COMPLETE",),
+    "succeeded": ("COMPLETE",),
+    "successful": ("COMPLETE",),
+    "canceled": ("CANCELED", "CANCELING"),
+    "cancelled": ("CANCELED", "CANCELING"),
+}
+
+
+def _wes_states(state: str) -> tuple[str, ...] | None:
+    """The WES states that a user's word for a state stands for, or None for 'any state'."""
+    word = (state or "").strip().lower()
+    if not word:
+        return None
+    return STATE_ALIASES.get(word, (word.upper().replace(" ", "_"),))
+
+
+def _wes_project(run: dict) -> str:
+    return (run.get("tags") or {}).get("ProjectId") or "no project"
+
+
+def _wes_line(run: dict) -> str:
+    name = run.get("name") or (run.get("tags") or {}).get("TaskName") or "unnamed"
+    return (
+        f"- {run.get('run_id')}: {name}, {run.get('state')}, project {_wes_project(run)}, "
+        f"{run.get('start_time') or '?'} to {run.get('end_time') or '?'}"
+    )
 
 
 def build_tools(client: NGS360Client) -> list[Any]:
@@ -108,8 +148,9 @@ def build_tools(client: NGS360Client) -> list[Any]:
 
     @tool
     async def search_runs(query: str = "") -> str:
-        """Search sequencing runs by words in the run id, experiment, instrument, flowcell,
-        date or status.
+        """Search SEQUENCING runs (instrument runs on a sequencer, with a flowcell) by words in the run id,
+        experiment, instrument, flowcell, date or status. For analysis / workflow runs, such as pipeline
+        executions that succeeded or failed, use list_workflow_runs instead.
 
         Use this for questions like "which runs are in progress", "runs on instrument
         A01234" or "runs from September". Status values are "Ready", "In Progress",
@@ -140,7 +181,8 @@ def build_tools(client: NGS360Client) -> list[Any]:
 
     @tool
     async def get_run(run_id: str) -> str:
-        """Get the details of one sequencing run, including how many samples are on it.
+        """Get the details of one SEQUENCING run (instrument run), including how many samples are on it.
+        For an analysis / workflow run use get_workflow_run.
 
         Args:
             run_id: The full run id, e.g. "260901_A01234_0080_ALJ91DDSXX".
@@ -237,4 +279,94 @@ def build_tools(client: NGS360Client) -> list[Any]:
         more = f"\nShowing {min(len(shown), MAX_ROWS)} of {len(shown)}." if len(shown) > MAX_ROWS else ""
         return header + "\n" + "\n".join(lines) + more
 
-    return [navigate, lookup_project, search_projects, search_runs, get_run, list_project_samples, get_qc]
+    @tool
+    async def list_workflow_runs(state: str = "", project_id: str = "") -> str:
+        """List ANALYSIS (workflow) runs, meaning pipeline executions on the compute platform, newest first.
+
+        Use this for "which analyses failed", "what is running", "runs for project P-..." and similar. These are
+        different from sequencing runs (instrument runs), which search_runs covers.
+
+        Args:
+            state: Optional. "failed", "running", "completed", "canceled", or an exact state such as
+                EXECUTOR_ERROR, COMPLETE, RUNNING, QUEUED.
+            project_id: Optional project id, e.g. "P-20261102-0004", to show only that project's runs.
+        """
+        try:
+            runs = await client.list_wes_runs()
+        except Exception as exc:  # noqa: BLE001
+            return f"Could not list analysis runs: {exc}"
+        states = _wes_states(state)
+        hits = [
+            r for r in runs
+            if (states is None or str(r.get("state", "")).upper() in states)
+            and (not project_id or _wes_project(r).lower() == project_id.strip().lower())
+        ]
+        hits.sort(key=lambda r: str(r.get("start_time") or ""), reverse=True)
+        if not hits:
+            return f"No analysis runs match state '{state}' and project '{project_id}' (searched {len(runs)})."
+        lines = [_wes_line(r) for r in hits[:MAX_ROWS]]
+        more = f"\nShowing {MAX_ROWS} of {len(hits)} matches." if len(hits) > MAX_ROWS else ""
+        return f"{len(hits)} analysis run(s):\n" + "\n".join(lines) + more
+
+    @tool
+    async def get_workflow_run(run_id: str) -> str:
+        """Get the details of one ANALYSIS (workflow) run: state, project, name, times, exit code, where its
+        outputs go, and the HealthOmics run it maps to. To learn why a run failed use explain_workflow_failure.
+
+        Args:
+            run_id: The analysis run id from list_workflow_runs, e.g. "8b2e402a-951a-4338-8a07-7ca339ab060b".
+        """
+        try:
+            run = await client.get_wes_run(run_id)
+        except Exception as exc:  # noqa: BLE001
+            return f"Could not fetch analysis run {run_id}: {exc}"
+        req = run.get("request") or {}
+        log = run.get("run_log") or {}
+        params = req.get("workflow_engine_parameters") or {}
+        return (
+            f"Analysis run {run.get('run_id')}: name {run.get('name')}, state {run.get('state')}, "
+            f"project {_wes_project({'tags': req.get('tags')})}, started {log.get('start_time')}, "
+            f"ended {log.get('end_time')}, exit code {log.get('exit_code')}, "
+            f"output location {params.get('outputUri')}, "
+            f"HealthOmics run {omics_client.omics_run_id_from_wes(run) or 'unknown'}, "
+            f"workflow {req.get('workflow_url')}."
+        )
+
+    @tool
+    async def explain_workflow_failure(run_id: str) -> str:
+        """Explain WHY an analysis (workflow) run failed, using the platform's own failure reason, the failed
+        task and the tail of the engine log. Use this for "why did run X fail" instead of guessing.
+
+        Args:
+            run_id: The analysis run id from list_workflow_runs.
+        """
+        try:
+            # Fetched with the caller's own token, so only runs this user may see can be explained.
+            run = await client.get_wes_run(run_id)
+        except Exception as exc:  # noqa: BLE001
+            return f"Could not fetch analysis run {run_id}: {exc}"
+        state = str(run.get("state"))
+        if state not in FAILED_STATES and state != "CANCELED":
+            return f"Run {run_id} is {state}, not failed, so there is no failure to explain."
+        project = _wes_project({"tags": (run.get("request") or {}).get("tags")})
+        header = f"Run {run_id} ({run.get('name')}, project {project}) ended in {state}"
+        omics_id = omics_client.omics_run_id_from_wes(run)
+        if not omics_id:
+            return header + ". The platform did not record a HealthOmics run for it, so no further detail is available."
+        try:
+            info = await omics_client.describe_failure(omics_id)
+        except Exception as exc:  # noqa: BLE001
+            return f"{header}. HealthOmics run {omics_id}; its details could not be read ({type(exc).__name__})."
+        parts = [
+            f"{header}. HealthOmics run {omics_id} is {info.get('status')}.",
+            f"Failure reason: {info.get('failure_reason') or 'not reported'}.",
+            f"Message: {info.get('message') or 'none'}",
+        ]
+        for task in info.get("failed_tasks") or []:
+            parts.append(f"Failed task {task.get('name')}: {task.get('status')} {task.get('message') or ''}".strip())
+        if info.get("log_tail"):
+            parts.append("Last engine log lines:\n" + "\n".join(f"  {line}" for line in info["log_tail"][-12:]))
+        return "\n".join(parts)
+
+    return [navigate, lookup_project, search_projects, search_runs, get_run, list_project_samples, get_qc,
+            list_workflow_runs, get_workflow_run, explain_workflow_failure]

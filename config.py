@@ -92,6 +92,17 @@ class Settings:
     def NGS360_API_URL(self) -> str:
         return self._get("NGS360_API_URL", default="http://localhost:3000/api/v1")
 
+    # GA4GH WES base used by the workflow-run tools. Defaults to /ga4gh/wes/v1 on the same host as the REST API.
+    @property
+    def NGS360_WES_URL(self) -> str:
+        explicit = self._get("NGS360_WES_URL")
+        if explicit:
+            return explicit
+        from urllib.parse import urlsplit
+
+        parts = urlsplit(self.NGS360_API_URL)
+        return f"{parts.scheme}://{parts.netloc}/ga4gh/wes/v1"
+
     # CORS allowed origin (the frontend).
     @property
     def CLIENT_ORIGIN(self) -> str | None:
