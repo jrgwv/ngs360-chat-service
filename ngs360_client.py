@@ -103,3 +103,7 @@ class NGS360Client:
 
     async def get_wes_run(self, run_id: str) -> dict:
         return await self._get(f"/runs/{run_id}", base=self._wes_base)
+
+    async def get_wes_diagnosis(self, run_id: str) -> dict:
+        """Why a run failed, read by the WES service from the execution engine (no AWS access needed here)."""
+        return await self._get(f"/runs/{run_id}/diagnosis", base=self._wes_base)

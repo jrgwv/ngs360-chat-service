@@ -14,7 +14,6 @@ from typing import Any
 
 from langchain_core.tools import tool
 
-import omics_client
 from ngs360_client import NGS360Client
 
 NAVIGABLE_TYPES = ("project", "run", "job")
@@ -311,7 +310,7 @@ def build_tools(client: NGS360Client) -> list[Any]:
     @tool
     async def get_workflow_run(run_id: str) -> str:
         """Get the details of one ANALYSIS (workflow) run: state, project, name, times, exit code, where its
-        outputs go, and the HealthOmics run it maps to. To learn why a run failed use explain_workflow_failure.
+        outputs go. To learn why a run failed use explain_workflow_failure.
 
         Args:
             run_id: The analysis run id from list_workflow_runs, e.g. "8b2e402a-951a-4338-8a07-7ca339ab060b".
@@ -328,7 +327,6 @@ def build_tools(client: NGS360Client) -> list[Any]:
             f"project {_wes_project({'tags': req.get('tags')})}, started {log.get('start_time')}, "
             f"ended {log.get('end_time')}, exit code {log.get('exit_code')}, "
             f"output location {params.get('outputUri')}, "
-            f"HealthOmics run {omics_client.omics_run_id_from_wes(run) or 'unknown'}, "
             f"workflow {req.get('workflow_url')}."
         )
 
@@ -350,15 +348,15 @@ def build_tools(client: NGS360Client) -> list[Any]:
             return f"Run {run_id} is {state}, not failed, so there is no failure to explain."
         project = _wes_project({"tags": (run.get("request") or {}).get("tags")})
         header = f"Run {run_id} ({run.get('name')}, project {project}) ended in {state}"
-        omics_id = omics_client.omics_run_id_from_wes(run)
-        if not omics_id:
-            return header + ". The platform did not record a HealthOmics run for it, so no further detail is available."
         try:
-            info = await omics_client.describe_failure(omics_id)
-        except Exception as exc:  # noqa: BLE001
-            return f"{header}. HealthOmics run {omics_id}; its details could not be read ({type(exc).__name__})."
+            # The WES service reads the execution engine itself, with the same authorization as the call above.
+            info = await client.get_wes_diagnosis(run_id)
+        except Exception as exc:  # noqa: BLE001 - report the class only, never raw error text
+            return f"{header}. Its failure details could not be read ({type(exc).__name__})."
+        if not info.get("available"):
+            return f"{header}. {info.get('note') or 'No further detail is available.'}"
         parts = [
-            f"{header}. HealthOmics run {omics_id} is {info.get('status')}.",
+            f"{header}. HealthOmics run {info.get('engine_run_id')} is {info.get('engine_status')}.",
             f"Failure reason: {info.get('failure_reason') or 'not reported'}.",
             f"Message: {info.get('message') or 'none'}",
         ]
