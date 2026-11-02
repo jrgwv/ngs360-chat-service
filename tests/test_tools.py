@@ -53,6 +53,14 @@ class FakeClient:
     async def get_project(self, project_id):
         return {}
 
+    async def search_qc(self, project_id="", run_id=""):
+        def m(name, status, cov):
+            return {"name": "sample_qc", "samples": [{"sample_name": name}],
+                    "values": [{"key": "mean_coverage", "value": cov}, {"key": "qc_status", "value": status}]}
+        rec = {"created_on": "2026-11-02T10:00:00", "metadata": [{"key": "pipeline", "value": "wgs"}, {"key": "synthetic", "value": "true"}],
+               "metrics": [m("S1", "PASS", 40.1), m("S2", "FAIL", 11.2)]}
+        return {"data": [rec] if (project_id or run_id) != "EMPTY" else []}
+
 
 def tool(name, client=None):
     return {t.name: t for t in tools.build_tools(client or FakeClient())}[name]
@@ -168,3 +176,17 @@ def test_client_does_not_retry_a_4xx(monkeypatch):
         raise AssertionError("expected 403")
     except httpx.HTTPStatusError:
         assert len(calls) == 1
+
+
+def test_get_qc_lists_failures_first():
+    out = asyncio.run(tool("get_qc").ainvoke({"project_id": "P-1"}))
+    assert "1 failing" in out and out.index("S2") < out.index("S1")
+    assert "synthetic" not in out
+
+
+def test_get_qc_failing_only_and_empty_and_args():
+    out = asyncio.run(tool("get_qc").ainvoke({"project_id": "P-1", "failing_only": True}))
+    assert "S2" in out and "S1" not in out
+    assert "No QC records" in asyncio.run(tool("get_qc").ainvoke({"project_id": "EMPTY"}))
+    assert "exactly one" in asyncio.run(tool("get_qc").ainvoke({}))
+    assert "exactly one" in asyncio.run(tool("get_qc").ainvoke({"project_id": "a", "run_id": "b"}))

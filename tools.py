@@ -192,4 +192,49 @@ def build_tools(client: NGS360Client) -> list[Any]:
         more = f"\nShowing {shown} of {len(hits)} matches." if len(hits) > shown else ""
         return f"{len(hits)} of {total} sample(s) in {project_id}:\n" + "\n".join(lines) + more + extra
 
-    return [navigate, lookup_project, search_projects, search_runs, get_run, list_project_samples]
+    @tool
+    async def get_qc(project_id: str = "", run_id: str = "", failing_only: bool = False) -> str:
+        """Get quality-control (QC) metrics for a project's samples or for a sequencing run.
+
+        Use this for questions like "which samples failed QC", "what is the coverage of the
+        samples in this project" or "how did the demux of this run look". Give exactly one of
+        ``project_id`` (per-sample metrics) or ``run_id`` (run-level demux metrics). Samples
+        with ``qc_status`` FAIL are listed first.
+
+        Args:
+            project_id: The project id, e.g. "P-20261102-0001".
+            run_id: The full run id, e.g. "260901_A01234_0080_ALJ91DDSXX".
+            failing_only: If true, list only samples whose qc_status is FAIL.
+        """
+        if bool(project_id) == bool(run_id):
+            return "Give exactly one of project_id or run_id."
+        scope = project_id or run_id
+        try:
+            data = await client.search_qc(project_id=project_id, run_id=run_id)
+        except Exception as exc:  # noqa: BLE001
+            return f"Could not fetch QC for {scope}: {exc}"
+        records = data.get("data", [])
+        if not records:
+            return f"No QC records for {scope}."
+        rec = records[0]
+        meta = ", ".join(f"{m['key']}={m['value']}" for m in rec.get("metadata", []) if m.get("key") != "synthetic")
+        rows = []
+        for m in rec.get("metrics", []):
+            vals = {v["key"]: v["value"] for v in m.get("values", [])}
+            names = ", ".join(x["sample_name"] for x in m.get("samples", [])) or m.get("name", "")
+            rows.append((names, vals))
+        failed = [r for r in rows if str(r[1].get("qc_status", "")).upper() == "FAIL"]
+        header = f"QC for {scope} (record {rec.get('created_on', '')[:10]}, {meta}): {len(rows)} metric group(s)"
+        if any("qc_status" in v for _, v in rows):
+            header += f", {len(failed)} failing"
+        shown = failed if failing_only else failed + [r for r in rows if r not in failed]
+        if failing_only and not failed:
+            return header + "\nNo failing samples."
+        lines = [
+            f"- {n}: " + ", ".join(f"{k}={v}" for k, v in list(vals.items())[:9])
+            for n, vals in shown[:MAX_ROWS]
+        ]
+        more = f"\nShowing {min(len(shown), MAX_ROWS)} of {len(shown)}." if len(shown) > MAX_ROWS else ""
+        return header + "\n" + "\n".join(lines) + more
+
+    return [navigate, lookup_project, search_projects, search_runs, get_run, list_project_samples, get_qc]

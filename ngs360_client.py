@@ -78,3 +78,8 @@ class NGS360Client:
 
     async def list_project_samples(self, project_id: str, skip: int = 0, limit: int = 100) -> dict:
         return await self._get(f"/projects/{project_id}/samples", {"skip": skip, "limit": limit})
+
+    async def search_qc(self, project_id: str = "", run_id: str = "") -> dict:
+        """Newest QC record for a project or a sequencing run (``latest`` is the API default)."""
+        params = {"project_id": project_id} if project_id else {"sequencing_run_id": run_id}
+        return await self._get("/qcmetrics/search", {**params, "latest": "true", "per_page": 20})
