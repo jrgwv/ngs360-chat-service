@@ -163,4 +163,7 @@ def test_stream_tool_call_emits_navigate(monkeypatch):
     )
     # Tools were advertised to Converse.
     names = {t["toolSpec"]["name"] for t in fake.calls[0]["toolConfig"]["tools"]}
-    assert names == {"navigate", "lookup_project"}
+    assert names == {
+        "navigate", "lookup_project", "search_projects", "search_runs", "get_run",
+        "list_project_samples",
+    }
