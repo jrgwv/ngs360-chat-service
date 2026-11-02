@@ -6,9 +6,13 @@ caller's bearer token, so the REST API enforces authorization — this service
 never touches the database.
 """
 
+import asyncio
+
 import httpx
 
 from config import get_settings
+
+RETRY_DELAY_S = 1.5
 
 
 class NGS360Client:
@@ -18,10 +22,25 @@ class NGS360Client:
         self._headers = {"Authorization": f"Bearer {token}"}
 
     async def _get(self, path: str, params: dict | None = None) -> dict:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(f"{self._base}{path}", headers=self._headers, params=params)
-            resp.raise_for_status()
-            return resp.json()
+        """GET with one retry on a timeout, connection error or 5xx.
+
+        These are idempotent reads, and the API's search can stall for several seconds when its
+        small OpenSearch node is garbage-collecting; a second attempt almost always succeeds.
+        """
+        for attempt in (1, 2):
+            try:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    resp = await client.get(f"{self._base}{path}", headers=self._headers, params=params)
+                if resp.status_code >= 500 and attempt == 1:
+                    await asyncio.sleep(RETRY_DELAY_S)
+                    continue
+                resp.raise_for_status()
+                return resp.json()
+            except (httpx.TimeoutException, httpx.ConnectError):
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(RETRY_DELAY_S)
+        raise RuntimeError("unreachable")  # pragma: no cover
 
     async def get_project(self, project_id: str) -> dict:
         # TODO: confirm the exact REST path/shape against the API's project router.

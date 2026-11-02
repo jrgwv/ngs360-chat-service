@@ -113,3 +113,58 @@ def test_tool_errors_are_returned_as_text_not_raised():
 def test_the_client_only_reads():
     src = inspect.getsource(ngs360_client)
     assert ".post(" not in src and ".put(" not in src and ".delete(" not in src and ".patch(" not in src
+
+
+class _Resp:
+    def __init__(self, status, body=None):
+        self.status_code, self._body = status, body or {}
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError("x", request=None, response=self)
+
+    def json(self):
+        return self._body
+
+
+def _client_with(monkeypatch, outcomes):
+    """NGS360Client whose HTTP layer replays ``outcomes`` (a response or an exception each)."""
+    calls = []
+
+    class FakeAsyncClient:
+        def __init__(self, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def get(self, url, **kw):
+            calls.append(url)
+            out = outcomes.pop(0)
+            if isinstance(out, Exception):
+                raise out
+            return out
+
+    monkeypatch.setattr(ngs360_client.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(ngs360_client, "RETRY_DELAY_S", 0)
+    return ngs360_client.NGS360Client("tok"), calls
+
+
+def test_client_retries_a_5xx_once_then_succeeds(monkeypatch):
+    c, calls = _client_with(monkeypatch, [_Resp(500), _Resp(200, {"ok": 1})])
+    assert asyncio.run(c._get("/runs/search")) == {"ok": 1} and len(calls) == 2
+
+
+def test_client_retries_a_timeout_once_then_gives_up(monkeypatch):
+    c, calls = _client_with(monkeypatch, [httpx.ReadTimeout("t"), httpx.ReadTimeout("t")])
+    try:
+        asyncio.run(c._get("/runs/search"))
+        raise AssertionError("expected a timeout")
+    except httpx.ReadTimeout:
+        assert len(calls) == 2
+
+
+def test_client_does_not_retry_a_4xx(monkeypatch):
+    c, calls = _client_with(monkeypatch, [_Resp(403)])
+    try:
+        asyncio.run(c._get("/projects/x"))
+        raise AssertionError("expected 403")
+    except httpx.HTTPStatusError:
+        assert len(calls) == 1
