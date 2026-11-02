@@ -33,3 +33,15 @@ class ChatRequest(BaseModel):
 
     messages: list[dict[str, Any]]
     context: ChatContext | None = None
+
+
+class ChatStreamRequest(ChatRequest):
+    """Request body of the frontend's ``POST /api/v1/chat/stream``.
+
+    The chat UI sends the whole conversation each time (``messages``) together
+    with the thread id it was given; the service keeps no per-thread state, so the
+    history in the request is all the agent sees. Unknown fields (``id``,
+    ``trigger``) are ignored.
+    """
+
+    thread_id: str | None = None

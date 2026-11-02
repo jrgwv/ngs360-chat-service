@@ -2,7 +2,8 @@
 Local tester for the chat service.
 
 Drives `services.stream_reply` directly (bypassing HTTP/auth), parses the SSE
-chunks, and renders streamed text and navigate events. Requires LLM_* in .env.
+chunks, and renders streamed text and navigate events. Requires an AWS identity
+with Bedrock access (LLM_MODEL / AWS_REGION in .env).
 
 A token is only needed for the data-lookup tools (which call the REST API); set
 NGS360_TOKEN to a real bearer token to exercise those, otherwise a placeholder

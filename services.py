@@ -1,18 +1,20 @@
 """
 Chat streaming service.
 
-Runs a LangChain agent (``create_agent``) backed by Claude on the AI Hub
-gateway and translates its event stream into the Vercel AI SDK UI Message
+Runs a LangChain agent (``create_agent``) backed by Claude on Amazon Bedrock
+(Converse API via ``langchain-aws``) and translates its event stream into the Vercel AI SDK UI Message
 Stream Protocol (SSE) the frontend's useChat consumes:
 https://ai-sdk.dev/docs/ai-sdk-ui/stream-protocol
 """
 
 import json
+import logging
 import uuid
 from typing import Any, AsyncGenerator
 
+from botocore.config import Config
 from langchain.agents import create_agent
-from langchain_anthropic import ChatAnthropic
+from langchain_aws import ChatBedrockConverse
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from config import get_settings
@@ -20,11 +22,16 @@ from models import ChatContext
 from ngs360_client import NGS360Client
 from tools import build_tools
 
+logger = logging.getLogger(__name__)
+
 SYSTEM_PROMPT = (
     "You are the NGS360 assistant. You help users work with their genomics "
     "projects, runs, samples, and jobs. Use the navigate tool when the user "
-    "asks to open or go to a specific entity, and use lookup tools to ground "
-    "your answers in real data rather than guessing. Be concise and direct."
+    "asks to open or go to a specific entity, and use the lookup and search "
+    "tools (search_projects, search_runs, get_run, list_project_samples, get_qc, "
+    "lookup_project) to ground your answers in real data rather than guessing. "
+    "These tools are read-only; you cannot change data. When a search reports "
+    "that only part of the records were searched, say so. Be concise and direct."
 )
 
 
@@ -77,31 +84,54 @@ def to_lc_messages(
     return lc_messages
 
 
+def build_llm() -> ChatBedrockConverse:
+    """Bedrock Converse chat model.
+
+    AWS access resolves through the default boto3 chain (ECS task role in
+    deployed environments); no API key is configured. Construction makes no
+    AWS call; the first request does.
+    """
+    settings = get_settings()
+    return ChatBedrockConverse(
+        model=settings.LLM_MODEL,
+        region_name=settings.AWS_REGION,
+        max_tokens=8000,
+        config=Config(
+            read_timeout=300,
+            connect_timeout=10,
+            retries={"max_attempts": 3, "mode": "adaptive"},
+        ),
+    )
+
+
 def build_agent(token: str):
     """Construct a ReAct agent whose tools call the REST API with ``token``."""
-    settings = get_settings()
-    llm = ChatAnthropic(
-        model=settings.LLM_MODEL,
-        base_url=f"{settings.LLM_BASE_URL}/anthropic",
-        api_key=settings.LLM_API_KEY,
-        timeout=300,
-        max_tokens=8000,
-        streaming=True,
-    )
-    return create_agent(llm, build_tools(NGS360Client(token)))
+    return create_agent(build_llm(), build_tools(NGS360Client(token)))
 
 
 def _delta_text(chunk: Any) -> str:
-    """Extract streamable text from an AIMessageChunk (str or content-block list)."""
+    """Extract streamable answer text from an AIMessageChunk.
+
+    Bedrock Converse streams ``content`` as a list of blocks, e.g.
+    ``[{"type": "text", "text": "Hi", "index": 0}]``; some versions omit
+    ``type`` on text deltas. Tool-use and reasoning blocks are skipped so only
+    user-facing text reaches the SSE stream.
+    """
     content = getattr(chunk, "content", "")
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        return "".join(
-            block.get("text", "")
-            for block in content
-            if isinstance(block, dict) and block.get("type") == "text"
-        )
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif (
+                isinstance(block, dict)
+                and block.get("type", "text") == "text"
+                and isinstance(block.get("text"), str)
+            ):
+                parts.append(block["text"])
+        return "".join(parts)
     return ""
 
 
@@ -140,3 +170,41 @@ async def stream_reply(
     yield sse_chunk({"type": "text-end", "id": text_id})
     yield sse_chunk({"type": "finish"})
     yield "data: [DONE]\n\n"
+
+
+def frame(payload: dict[str, Any]) -> str:
+    """One frame of the chat UI's stream (thread / status / text / done / error)."""
+    return sse_chunk(payload)
+
+
+async def stream_frames(
+    messages: list[dict[str, Any]],
+    token: str,
+    context: ChatContext | None,
+    thread_id: str | None,
+) -> AsyncGenerator[str, None]:
+    """Run the agent and stream its reply as the chat UI's own frames.
+
+    This is the protocol of the REST API's ``POST /api/v1/chat/stream``, which the
+    frontend's chat transport maps onto the AI SDK: a ``thread`` frame first, a
+    ``status`` frame when a tool is called, ``text`` frames for the answer, then
+    ``done`` (or ``error``). The service is stateless, so the thread id is only
+    echoed (or minted) for the client's bookkeeping.
+    """
+    yield frame({"type": "thread", "thread_id": thread_id or str(uuid.uuid4())})
+    try:
+        agent = build_agent(token)
+        lc_messages = to_lc_messages(messages, context)
+        async for event in agent.astream_events({"messages": lc_messages}, version="v2"):
+            kind = event["event"]
+            if kind == "on_tool_start" and event.get("name"):
+                yield frame({"type": "status", "tool": event["name"]})
+            elif kind == "on_chat_model_stream":
+                delta = _delta_text(event["data"]["chunk"])
+                if delta:
+                    yield frame({"type": "text", "delta": delta})
+    except Exception:  # noqa: BLE001 - reported in-band; never leak internals to the client
+        logger.exception("chat stream failed")
+        yield frame({"type": "error", "message": "The assistant ran into a problem. Please try again."})
+        return
+    yield frame({"type": "done"})
