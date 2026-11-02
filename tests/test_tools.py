@@ -38,7 +38,8 @@ DIAGNOSES = {
     "w-bad": {"run_id": "w-bad", "available": True, "engine_run_id": "2933968", "engine_status": "FAILED",
               "failure_reason": "CANNOT_START_CONTAINER_ERROR", "message": "Unable to start workflow task: main.cwl",
               "failed_tasks": [{"name": "main.cwl", "status": "FAILED", "message": ""}],
-              "log_tail": ["engine: container exited"], "note": None},
+              "log_tail": ["engine: container exited"], "note": None,
+              "hint": "Add bash to the image or use a bash-based image."},
     "w-nolink": {"run_id": "w-nolink", "available": False, "engine_run_id": None,
                  "note": "This run has no execution-engine run ID yet, so there is nothing more to read."},
 }
@@ -271,6 +272,7 @@ def test_explain_failure_uses_the_reason_from_the_wes_service():
     assert "HealthOmics run 2933968 is FAILED" in out
     assert "CANNOT_START_CONTAINER_ERROR" in out and "Unable to start workflow task" in out
     assert "Failed task main.cwl" in out and "engine: container exited" in out
+    assert "Likely next step: Add bash to the image" in out
 
 
 def test_explain_failure_skips_healthy_runs_reports_missing_details_and_hides_raw_errors():

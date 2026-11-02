@@ -360,6 +360,8 @@ def build_tools(client: NGS360Client) -> list[Any]:
             f"Failure reason: {info.get('failure_reason') or 'not reported'}.",
             f"Message: {info.get('message') or 'none'}",
         ]
+        if info.get("hint"):
+            parts.append(f"Likely next step: {info['hint']}")
         for task in info.get("failed_tasks") or []:
             parts.append(f"Failed task {task.get('name')}: {task.get('status')} {task.get('message') or ''}".strip())
         if info.get("log_tail"):
