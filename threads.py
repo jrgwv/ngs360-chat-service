@@ -51,6 +51,26 @@ def _iso(moment: datetime) -> str:
     return moment.isoformat(timespec="milliseconds")
 
 
+_SECRET_PATTERNS = [
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)"),
+    re.compile(r"\b(?:AKIA|ASIA|AIDA|AROA|AGPA)[A-Z0-9]{16}\b"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"),
+    re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{20,}", re.IGNORECASE),
+    re.compile(r"(?i)(?:password|passwd|secret|api[_-]?key|access[_-]?key|token)\s*[:=]\s*[^\s,;]{8,}"),
+]
+
+
+def redact_secrets(text: str) -> str:
+    """Replace credential-looking strings with [redacted]. Saved history must never hold a pasted key or password.
+
+    The guardrail blocks such a message before the model answers, but the question is saved before the model runs, and
+    the chat UI resends it with every later turn, so the saved copy is scrubbed here, every time. Stateless and idempotent.
+    """
+    for pattern in _SECRET_PATTERNS:
+        text = pattern.sub("[redacted]", text)
+    return text
+
+
 def message_text(message: dict[str, Any]) -> str:
     """The visible text of a UIMessage: its text parts joined, nothing else."""
     parts = message.get("parts") or []
@@ -67,11 +87,11 @@ def project_messages(messages: list[dict[str, Any]], reply: str | None = None) -
     out: list[dict[str, Any]] = []
     for m in messages:
         role = m.get("role")
-        text = message_text(m)
+        text = redact_secrets(message_text(m))
         if role in ("user", "assistant") and text:
             out.append({"role": role, "text": text[:MAX_MESSAGE_CHARS]})
     if reply and reply.strip():
-        out.append({"role": "assistant", "text": reply.strip()[:MAX_MESSAGE_CHARS]})
+        out.append({"role": "assistant", "text": redact_secrets(reply.strip())[:MAX_MESSAGE_CHARS]})
     # Drop the oldest messages until the transcript fits one item.
     while out and len(json.dumps(out)) > MAX_TRANSCRIPT_BYTES:
         out.pop(0)

@@ -108,6 +108,16 @@ class Settings:
     def CLIENT_ORIGIN(self) -> str | None:
         return self._get("CLIENT_ORIGIN")
 
+    # Amazon Bedrock Guardrails. Both must be set to switch the guardrail on; unset means no guardrail (the
+    # previous behaviour). The version is a number such as "1", not DRAFT.
+    @property
+    def GUARDRAIL_ID(self) -> str | None:
+        return self._get("GUARDRAIL_ID")
+
+    @property
+    def GUARDRAIL_VERSION(self) -> str | None:
+        return self._get("GUARDRAIL_VERSION")
+
     # Saved conversations. Unset means the service keeps no history (the previous behaviour).
     @property
     def CHAT_THREADS_TABLE(self) -> str | None:

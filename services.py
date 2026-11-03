@@ -97,6 +97,20 @@ def build_llm() -> ChatBedrockConverse:
     AWS call; the first request does.
     """
     settings = get_settings()
+    options: dict[str, Any] = {}
+    if settings.GUARDRAIL_ID and settings.GUARDRAIL_VERSION:
+        options = {
+            # sync: Bedrock checks each part of the answer before it is streamed on, so nothing blocked leaks out.
+            "guardrail_config": {
+                "guardrailIdentifier": settings.GUARDRAIL_ID,
+                "guardrailVersion": settings.GUARDRAIL_VERSION,
+                "trace": "enabled",
+                "streamProcessingMode": "sync",
+            },
+            # The chat UI resends the whole conversation every turn. Without this, one blocked message would be
+            # checked again, and block every later turn. Only the newest question and the answer are checked.
+            "guard_last_turn_only": True,
+        }
     return ChatBedrockConverse(
         model=settings.LLM_MODEL,
         region_name=settings.AWS_REGION,
@@ -106,7 +120,37 @@ def build_llm() -> ChatBedrockConverse:
             connect_timeout=10,
             retries={"max_attempts": 3, "mode": "adaptive"},
         ),
+        **options,
     )
+
+
+def guardrail_policies(trace: Any) -> list[str]:
+    """Names of the guardrail policies that acted, from a Converse trace, e.g. ``content:PROMPT_ATTACK``.
+
+    Only policy names are returned. The trace also carries the text that matched (for example the pasted key), and
+    that must never reach a log, so no value other than a policy type or name is read.
+    """
+    found: set[str] = set()
+    guard = (trace or {}).get("guardrail") or {}
+    assessments = []
+    if isinstance(guard.get("inputAssessment"), dict):
+        assessments += list(guard["inputAssessment"].values())
+    if isinstance(guard.get("outputAssessments"), dict):
+        for group in guard["outputAssessments"].values():
+            assessments += list(group or [])
+    for a in assessments:
+        if not isinstance(a, dict):
+            continue
+        for f in (a.get("contentPolicy") or {}).get("filters") or []:
+            if f.get("action") == "BLOCKED":
+                found.add(f"content:{f.get('type')}")
+        for e in (a.get("sensitiveInformationPolicy") or {}).get("piiEntities") or []:
+            if e.get("action") in ("BLOCKED", "ANONYMIZED"):
+                found.add(f"sensitive:{e.get('type')}")
+        for t in (a.get("topicPolicy") or {}).get("topics") or []:
+            if t.get("action") == "BLOCKED":
+                found.add(f"topic:{t.get('name')}")
+    return sorted(found)
 
 
 def build_agent(token: str):
@@ -182,6 +226,14 @@ def frame(payload: dict[str, Any]) -> str:
     return sse_chunk(payload)
 
 
+def _log_guardrail(output: Any, owner: str | None) -> None:
+    """Record that the guardrail acted. Policy names only; the question and the answer are never logged."""
+    meta = getattr(output, "response_metadata", None) or {}
+    policies = guardrail_policies(meta.get("trace"))
+    if meta.get("stopReason") == "guardrail_intervened" or policies:
+        logger.warning("guardrail intervened: owner=%s policies=%s", owner, ",".join(policies) or "unknown")
+
+
 async def stream_frames(
     messages: list[dict[str, Any]],
     token: str,
@@ -222,6 +274,8 @@ async def stream_frames(
             kind = event["event"]
             if kind == "on_tool_start" and event.get("name"):
                 yield frame({"type": "status", "tool": event["name"]})
+            elif kind == "on_chat_model_end":
+                _log_guardrail(event["data"].get("output"), owner)
             elif kind == "on_chat_model_stream":
                 delta = _delta_text(event["data"]["chunk"])
                 if delta:
