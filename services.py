@@ -7,6 +7,7 @@ Stream Protocol (SSE) the frontend's useChat consumes:
 https://ai-sdk.dev/docs/ai-sdk-ui/stream-protocol
 """
 
+import asyncio
 import json
 import logging
 import uuid
@@ -186,16 +187,34 @@ async def stream_frames(
     token: str,
     context: ChatContext | None,
     thread_id: str | None,
+    *,
+    owner: str | None = None,
+    store: Any = None,
 ) -> AsyncGenerator[str, None]:
     """Run the agent and stream its reply as the chat UI's own frames.
 
     This is the protocol of the REST API's ``POST /api/v1/chat/stream``, which the
     frontend's chat transport maps onto the AI SDK: a ``thread`` frame first, a
     ``status`` frame when a tool is called, ``text`` frames for the answer, then
-    ``done`` (or ``error``). The service is stateless, so the thread id is only
-    echoed (or minted) for the client's bookkeeping.
+    ``done`` (or ``error``).
+
+    With a thread ``store`` and an ``owner`` the conversation is saved: the thread is created (or updated) before
+    the agent runs, so its id and the user's message survive a failed run, and the answer is added once it has
+    streamed. Saving never blocks or fails an answer: a storage error is logged and the reply goes on. Without a
+    store the service is stateless and the thread id is only echoed (or minted) for the client's bookkeeping.
     """
+    saving = store is not None and owner is not None
+    if saving:
+        try:
+            if thread_id is None:
+                thread_id = await asyncio.to_thread(store.create, owner, messages)
+            else:
+                await asyncio.to_thread(store.save, owner, thread_id, messages)
+        except Exception:  # noqa: BLE001 - history is best effort; the answer matters more
+            logger.exception("could not save the conversation")
+            saving = False
     yield frame({"type": "thread", "thread_id": thread_id or str(uuid.uuid4())})
+    reply: list[str] = []
     try:
         agent = build_agent(token)
         lc_messages = to_lc_messages(messages, context)
@@ -206,9 +225,15 @@ async def stream_frames(
             elif kind == "on_chat_model_stream":
                 delta = _delta_text(event["data"]["chunk"])
                 if delta:
+                    reply.append(delta)
                     yield frame({"type": "text", "delta": delta})
     except Exception:  # noqa: BLE001 - reported in-band; never leak internals to the client
         logger.exception("chat stream failed")
         yield frame({"type": "error", "message": "The assistant ran into a problem. Please try again."})
         return
+    if saving:
+        try:
+            await asyncio.to_thread(store.save, owner, thread_id, messages, "".join(reply))
+        except Exception:  # noqa: BLE001
+            logger.exception("could not save the answer")
     yield frame({"type": "done"})

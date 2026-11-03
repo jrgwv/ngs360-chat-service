@@ -108,6 +108,21 @@ class Settings:
     def CLIENT_ORIGIN(self) -> str | None:
         return self._get("CLIENT_ORIGIN")
 
+    # Saved conversations. Unset means the service keeps no history (the previous behaviour).
+    @property
+    def CHAT_THREADS_TABLE(self) -> str | None:
+        return self._get("CHAT_THREADS_TABLE")
+
+    # Days a conversation is kept after its last message.
+    @property
+    def CHAT_THREAD_TTL_DAYS(self) -> int:
+        return max(1, int(self._get("CHAT_THREAD_TTL_DAYS", default="90") or 90))
+
+    # Most conversations kept per user; starting another removes the oldest.
+    @property
+    def CHAT_MAX_THREADS(self) -> int:
+        return max(1, int(self._get("CHAT_MAX_THREADS", default="200") or 200))
+
 
 @lru_cache
 def get_settings() -> Settings:

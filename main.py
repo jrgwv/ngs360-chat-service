@@ -6,7 +6,10 @@ Stream Protocol. Split out of the REST API so the LangChain dependency tree and
 the long-lived streaming workload stay isolated.
 """
 
-from fastapi import FastAPI, Response
+import asyncio
+import math
+
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
@@ -14,6 +17,7 @@ import services
 from auth import AuthDep
 from config import get_settings, validate_security_settings
 from models import ChatRequest, ChatStreamRequest
+from threads import get_thread_store, is_thread_id, to_ui_messages
 
 app = FastAPI(title="NGS360 Chat Service")
 
@@ -75,40 +79,68 @@ _SSE_HEADERS = {
 @app.post("/api/v1/chat/stream")
 async def chat_stream(request: ChatStreamRequest, auth: AuthDep) -> StreamingResponse:
     """Stream a reply as the chat UI's frames (thread, status, text, done, error)."""
+    store = get_thread_store()
+    if store is not None and request.thread_id is not None:
+        # A thread id is only ever one this service minted for this user; anything else is gone.
+        if not is_thread_id(request.thread_id) or not await asyncio.to_thread(
+            store.exists, auth.username, request.thread_id
+        ):
+            raise HTTPException(status_code=404, detail="Conversation not found")
     return StreamingResponse(
-        services.stream_frames(request.messages, auth.token, request.context, request.thread_id),
+        services.stream_frames(
+            request.messages, auth.token, request.context, request.thread_id,
+            owner=auth.username, store=store,
+        ),
         media_type="text/event-stream",
         headers=_SSE_HEADERS,
     )
 
 
-# The chat UI also lists and deletes conversation threads. This service keeps no
-# conversation state (the UI resends the history), so there is nothing to list:
-# answer with an empty history instead of a 404 so the panel stays quiet.
+# The chat UI lists, reopens and deletes conversation threads. With CHAT_THREADS_TABLE set they are saved per user
+# (see threads.py). Without it the service keeps no history and answers with an empty one, as it always did, so
+# the panel stays quiet instead of showing errors.
 @app.get("/api/v1/chat/threads")
 def list_threads(auth: AuthDep, skip: int = 0, limit: int = 20) -> dict[str, object]:
     limit = max(1, min(limit, 100))
+    skip = max(0, skip)
+    store = get_thread_store()
+    items, total = ([], 0) if store is None else store.list(auth.username, skip, limit)
     return {
-        "data": [],
-        "total_items": 0,
-        "total_pages": 0,
-        "current_page": max(0, skip) // limit + 1,
+        "data": [
+            {"id": i["thread_id"], "title": i["title"], "created_at": i["created_at"], "updated_at": i["updated_at"]}
+            for i in items
+        ],
+        "total_items": total,
+        "total_pages": math.ceil(total / limit),
+        "current_page": skip // limit + 1,
         "per_page": limit,
-        "has_next": False,
-        "has_prev": False,
+        "has_next": skip + limit < total,
+        "has_prev": total > 0 and skip > 0,
     }
 
 
 @app.get("/api/v1/chat/threads/{thread_id}/messages")
 def thread_messages(thread_id: str, auth: AuthDep) -> dict[str, object]:
-    return {"thread_id": thread_id, "messages": []}
+    store = get_thread_store()
+    if store is None:
+        return {"thread_id": thread_id, "messages": []}
+    stored = store.messages(auth.username, thread_id) if is_thread_id(thread_id) else None
+    if stored is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return {"thread_id": thread_id, "messages": to_ui_messages(stored)}
 
 
 @app.delete("/api/v1/chat/threads", status_code=204)
 def delete_all_threads(auth: AuthDep) -> Response:
+    store = get_thread_store()
+    if store is not None:
+        store.delete_all(auth.username)
     return Response(status_code=204)
 
 
 @app.delete("/api/v1/chat/threads/{thread_id}", status_code=204)
 def delete_thread(thread_id: str, auth: AuthDep) -> Response:
+    store = get_thread_store()
+    if store is not None and is_thread_id(thread_id):
+        store.delete(auth.username, thread_id)
     return Response(status_code=204)
